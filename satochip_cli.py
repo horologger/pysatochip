@@ -33,6 +33,7 @@ from ecdsa import SECP256k1, ECDH
 from mnemonic import Mnemonic
 from nostr.event import Event, EventKind
 from smartcard.System import readers
+from smartcard.CardConnection import CardConnection
 
 from pysatochip.CardConnector import (CardConnector, IncorrectUnlockCodeError, IncorrectUnlockCounterError,
                                       IdentityBlockedError, WrongPinError)
@@ -50,6 +51,9 @@ logging.basicConfig(level=logging.WARNING, format='%(levelname)s [%(module)s] %(
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 
+print(f"DEBUG: CardConnection.T0_protocol = {CardConnection.T0_protocol}")
+print(f"DEBUG: CardConnection.T1_protocol = {CardConnection.T1_protocol}")
+print(f"DEBUG: CardConnection.RAW_protocol = {CardConnection.RAW_protocol}")
 
 def mnemonic_to_masterseed(bip39_mnemonic, bip39_passphrase, mnemonic_type):
     print(mnemonic_type)
@@ -1157,6 +1161,8 @@ def satochip_sign_message(message, keyslot, path):
     """Sign a Message with the Satochip"""
     message_byte = message.encode('utf8')
 
+    print(f"DEBUG: message_byte: {message_byte}")
+
     try:
         # get PIN from environment variable or interactively
         if 'PYSATOCHIP_PIN' in environ:
@@ -1186,6 +1192,7 @@ def satochip_sign_message(message, keyslot, path):
         else:
             pubkey = cc.satochip_get_pubkey_from_keyslot(keyslot)
         # sign message
+        print(f"PreSign: keyslot: {keyslot}, pubkey: {pubkey}, message_byte: {message_byte}, hmac: {hmac}")
         (response2, sw1, sw2, compsig) = cc.card_sign_message(keyslot, pubkey, message_byte, hmac)
         if  compsig == b'':
             print("Wrong signature: the 2FA device may have rejected the action.")

@@ -5,6 +5,7 @@ from smartcard.CardMonitoring import CardMonitor, CardObserver
 from smartcard.Exceptions import CardConnectionException, CardRequestTimeoutException
 from smartcard.util import toHexString, toBytes
 from smartcard.sw.SWExceptions import SWException
+from smartcard.CardConnection import CardConnection
 
 from .JCconstants import *
 from .CardDataParser import CardDataParser
@@ -20,6 +21,7 @@ import base64
 import logging
 from os import urandom
 from typing import Union
+import getpass
 
 #debug
 # import sys
@@ -111,8 +113,35 @@ class RemovalObserver(CardObserver):
             logger.info(f"+Inserted: {toHexString(card.atr)}")
             self.cc.card_present= True
             self.cc.cardservice= card
+            print(f"DEBUG: CardConnection.T0_protocol = {CardConnection.T0_protocol}")
             self.cc.cardservice.connection = card.createConnection()
-            self.cc.cardservice.connection.connect()
+            
+            # Try each protocol in sequence
+            protocols = [
+                (CardConnection.T0_protocol, "T0"),
+                (CardConnection.T1_protocol, "T1"),
+                (CardConnection.RAW_protocol, "RAW")
+            ]
+            
+            connected = False
+            last_error = None
+            
+            for protocol, name in protocols:
+                try:
+                    print(f"DEBUG: Trying {name} protocol...")
+                    self.cc.cardservice.connection.connect(protocol)
+                    print(f"DEBUG: Successfully connected using {name} protocol")
+                    print(f"DEBUG: connection.protocol = {self.cc.cardservice.connection.getProtocol()}")
+                    connected = True
+                    break
+                except Exception as e:
+                    last_error = e
+                    print(f"DEBUG: Failed to connect using {name} protocol: {str(e)}")
+                    continue
+            
+            if not connected:
+                raise Exception(f"Failed to connect with any protocol. Last error: {str(last_error)}")
+                
             self.cc.cardservice.connection.addObserver(self.observer)
             
             # get CPLC
@@ -228,31 +257,126 @@ class CardConnector:
     ###########################################
 
     def card_transmit(self, plain_apdu):
+        """Transmit a plain APDU to the card"""
         logger.debug("In card_transmit")
-
-        while(self.card_present):
+        
+        # Try each protocol in sequence if we haven't established a connection yet
+        if not hasattr(self, 'protocol_tried'):
+            self.protocol_tried = False
+            protocols = [
+                (CardConnection.T0_protocol, "T0"),
+                (CardConnection.T1_protocol, "T1"),
+                (CardConnection.RAW_protocol, "RAW")
+            ]
             
+            for protocol, name in protocols:
+                try:
+                    print(f"DEBUG: Trying {name} protocol...")
+                    self.cardservice.connection.connect(protocol)
+                    print(f"DEBUG: Successfully connected using {name} protocol")
+                    self.protocol_tried = True
+                    break
+                except Exception as e:
+                    print(f"DEBUG: Failed to connect using {name} protocol: {str(e)}")
+                    continue
+            
+            if not self.protocol_tried:
+                raise Exception("Failed to connect with any protocol")
+        
+        while(self.card_present):
+            # First try to select the Satochip applet
+            select_apdu = [0x00, 0xA4, 0x04, 0x00, 0x0A, 0xA0, 0x00, 0x00, 0x00, 0x62, 0x03, 0x01, 0x0C, 0x06, 0x01]
+            try:
+                print(f"ATTEMPT: select_apdu: {' '.join([f'{x:02x}' for x in select_apdu])}")
+                self.cardservice.connection.transmit(select_apdu)
+            except Exception as e:
+                print(f"DEBUG: Failed to select Satochip applet: {str(e)}")
+                # Try other applets
+                select_apdu = [0x00, 0xA4, 0x04, 0x00, 0x0A, 0xA0, 0x00, 0x00, 0x00, 0x62, 0x03, 0x01, 0x0C, 0x06, 0x02]
+                try:
+                    self.cardservice.connection.transmit(select_apdu)
+                except Exception as e:
+                    print(f"DEBUG: Failed to select alternative applet: {str(e)}")
+                    raise Exception("Failed to select any applet")
+
             #encrypt apdu
-            ins= plain_apdu[1]
+            print(f"APDU: plain_apdu: {' '.join([f'{x:02x}' for x in plain_apdu])}")
+            ins = plain_apdu[1]
+            match ins:
+                case 0xA4:
+                    print(f"NO ENCRYPTION: SELECT SATOCHIP")
+                case 0x81:
+                    print(f"NO ENCRYPTION: INIT_SECURE_CHANNEL")
+                case 0x82:
+                    print(f"NO ENCRYPTION: PROCESS_SECURE_CHANNEL")
+                case 0xFF:
+                    print(f"NO ENCRYPTION: FF")
+                case 0x3C:
+                    print(f"NO ENCRYPTION: GET_STATUS")
+                case 0x73:
+                    print(f"ENCRYPTION: BIP32_GET_AUTHENTIKEY")
+                case 0x75:
+                    print(f"ENCRYPTION: 75 BIP32_GET_AUTHENTIKEY_COORDX")
+                case 0x6d:
+                    print(f"ENCRYPTION: GET_EXTENDED_KEY")
+                case 0x6e:
+                    print(f"ENCRYPTION: SIGN_MESSAGE")
+                case 0x72:
+                    print(f"ENCRYPTION: SIGN_SHORT_MESSAGE")
+                case 0x6f:
+                    print(f"ENCRYPTION: SIGN_TRANSACTION")
+                case 0x70:
+                    print(f"ENCRYPTION: SET_EXTENDED_KEY")
+                case _:
+                    print(f"ENCRYPTION: UNKNOWN: 0x{ins:02x}")
             if (self.needs_secure_channel) and (ins not in [0xA4, 0x81, 0x82, 0xFF, JCconstants.INS_GET_STATUS]):
-                apdu = self.card_encrypt_secure_channel(plain_apdu)
+                try:
+                    apdu = self.card_encrypt_secure_channel(plain_apdu)
+                except Exception as e:
+                    print(f"DEBUG: Failed to encrypt APDU: {str(e)}")
+                    # Try to initialize secure channel
+                    try:
+                        self.card_initiate_secure_channel()
+                        apdu = self.card_encrypt_secure_channel(plain_apdu)
+                    except Exception as e:
+                        print(f"DEBUG: Failed to initialize secure channel: {str(e)}")
+                        raise
             else:
-                apdu= plain_apdu
+                apdu = plain_apdu
+
+            # Debug: Print the APDU command
+            print(f"ENCRYPTED: APDU: {' '.join([f'{x:02x}' for x in apdu])}")
                 
             # transmit apdu
             (response, sw1, sw2) = self.cardservice.connection.transmit(apdu)
             
+            # Debug: Print the response
+            print(f"APDU: Response: {' '.join([f'{x:02x}' for x in response])}, SW1: {sw1:02x}, SW2: {sw2:02x}")
+            
             # PIN authentication is required
             if (sw1==0x9C) and (sw2==0x06):
-                (response, sw1, sw2)= self.card_verify_PIN_simple()
+                print("DEBUG: PIN authentication required")
+                try:
+                    (response, sw1, sw2) = self.card_verify_PIN_simple()
+                except Exception as e:
+                    print(f"DEBUG: PIN verification failed: {str(e)}")
+                    raise
             # secure channel not initialized
             elif (sw1==0x9C) and (sw2==0x21):
                 logger.error("In card_transmit secure channel not initialized (0x9C21)")
-                self.card_initiate_secure_channel()
+                try:
+                    self.card_initiate_secure_channel()
+                    # Retry the command after secure channel initialization
+                    if (self.needs_secure_channel) and (ins not in [0xA4, 0x81, 0x82, 0xFF, JCconstants.INS_GET_STATUS]):
+                        apdu = self.card_encrypt_secure_channel(plain_apdu)
+                    (response, sw1, sw2) = self.cardservice.connection.transmit(apdu)
+                except Exception as e:
+                    print(f"DEBUG: Failed to initialize secure channel: {str(e)}")
+                    raise
             #decrypt response
             elif (sw1==0x90) and (sw2==0x00):
                 if (self.needs_secure_channel) and (ins not in [0xA4, 0x81, 0x82, 0xFF, JCconstants.INS_GET_STATUS]):
-                    response= self.card_decrypt_secure_channel(response)
+                    response = self.card_decrypt_secure_channel(response)
                 return (response, sw1, sw2)
             else:
                 return (response, sw1, sw2)
@@ -372,73 +496,83 @@ class CardConnector:
         return (response, sw1, sw2)
 
     def card_get_status(self):
+        """Get the card status"""
         logger.debug("In card_get_status")
-        cla= JCconstants.CardEdge_CLA
-        ins= JCconstants.INS_GET_STATUS
-        p1= 0x00
-        p2= 0x00
-        apdu=[cla, ins, p1, p2]
-        (response, sw1, sw2)= self.card_transmit(apdu) # todo: try/except if setup not done
-        d={}
-        if (sw1==0x90) and (sw2==0x00):
-            # card applet version
-            d["protocol_major_version"]= response[0]
-            d["protocol_minor_version"]= response[1]
-            d["applet_major_version"]= response[2]
-            d["applet_minor_version"]= response[3]
-            d["protocol_version"]= (d["protocol_major_version"]<<8)+d["protocol_minor_version"] 
-            self.protocol_version= d["protocol_version"] #cache version
-            # PIN/PUK status
-            if len(response) >=8:
-                d["PIN0_remaining_tries"]= response[4]
-                d["PUK0_remaining_tries"]= response[5]
-                d["PIN1_remaining_tries"]= response[6]
-                d["PUK1_remaining_tries"]= response[7]
-                self.needs_2FA= d["needs2FA"]= False #default value
-            # 2FA status
-            if len(response) >=9:
-                self.needs_2FA= d["needs2FA"]= False if response[8]==0X00 else True
-            # seed status (satochip)
-            if len(response) >=10:
-                self.is_seeded= d["is_seeded"]= False if response[9]==0X00 else True
-            # setup status
-            if len(response) >=11:
-                self.setup_done= d["setup_done"]= False if response[10]==0X00 else True
-            else:
-                self.setup_done= d["setup_done"]= True    
-            # secure channel status
-            if len(response) >=12:
-                self.needs_secure_channel= d["needs_secure_channel"]= False if response[11]==0X00 else True    
-            else:
-                self.needs_secure_channel= d["needs_secure_channel"]= False
-            # NFC policy
-            if len(response) >=13:
-                self.nfc_policy= d["nfc_policy"]= response[12] # 0:NFC_ENABLED, 1:NFC_DISABLED, 2:NFC_BLOCKED
-            else:
-                self.nfc_policy= d["nfc_policy"]= 0x00 # NFC_ENABLED by default
-            # optional features policy
-            # currently only for satochip v0.14-0.5+
-            if len(response) >=16:
-                # 0:FEATURE_ENABLED, 1:FEATURE_DISABLED, 2:FEATURE_BLOCKED
-                self.feature_schnorr_policy= d["feature_schnorr_policy"]= response[13]
-                self.feature_nostr_policy = d["feature_nostr_policy"] = response[14]
-                self.feature_liquid_policy = d["feature_liquid_policy"] = response[15]
-            else:
-                # unsupported by default
-                self.feature_schnorr_policy = d["feature_schnorr_policy"] = None
-                self.feature_nostr_policy = d["feature_nostr_policy"] = None
-                self.feature_liquid_policy = d["feature_liquid_policy"] = None
+        try:
+            # First select the applet
+            self.card_select()
+            
+            # Now send the GET_STATUS command
+            cla = JCconstants.CardEdge_CLA
+            ins = JCconstants.INS_GET_STATUS
+            p1 = 0x00
+            p2 = 0x00
+            apdu = [cla, ins, p1, p2]
+            (response, sw1, sw2) = self.card_transmit(apdu)
+            d = {}
+            
+            if (sw1==0x90) and (sw2==0x00):
+                # card applet version
+                d["protocol_major_version"] = response[0]
+                d["protocol_minor_version"] = response[1]
+                d["applet_major_version"] = response[2]
+                d["applet_minor_version"] = response[3]
+                d["protocol_version"] = (d["protocol_major_version"]<<8)+d["protocol_minor_version"] 
+                self.protocol_version = d["protocol_version"] #cache version
+                # PIN/PUK status
+                if len(response) >=8:
+                    d["PIN0_remaining_tries"] = response[4]
+                    d["PUK0_remaining_tries"] = response[5]
+                    d["PIN1_remaining_tries"] = response[6]
+                    d["PUK1_remaining_tries"] = response[7]
+                    self.needs_2FA = d["needs2FA"] = False #default value
+                # 2FA status
+                if len(response) >=9:
+                    self.needs_2FA = d["needs2FA"] = False if response[8]==0X00 else True
+                # seed status (satochip)
+                if len(response) >=10:
+                    self.is_seeded = d["is_seeded"] = False if response[9]==0X00 else True
+                # setup status
+                if len(response) >=11:
+                    self.setup_done = d["setup_done"] = False if response[10]==0X00 else True
+                else:
+                    self.setup_done = d["setup_done"] = True    
+                # secure channel status
+                if len(response) >=12:
+                    self.needs_secure_channel = d["needs_secure_channel"] = False if response[11]==0X00 else True    
+                else:
+                    self.needs_secure_channel = d["needs_secure_channel"] = False
+                # NFC policy
+                if len(response) >=13:
+                    self.nfc_policy = d["nfc_policy"] = response[12] # 0:NFC_ENABLED, 1:NFC_DISABLED, 2:NFC_BLOCKED
+                else:
+                    self.nfc_policy = d["nfc_policy"] = 0x00 # NFC_ENABLED by default
+                # optional features policy
+                # currently only for satochip v0.14-0.5+
+                if len(response) >=16:
+                    # 0:FEATURE_ENABLED, 1:FEATURE_DISABLED, 2:FEATURE_BLOCKED
+                    self.feature_schnorr_policy = d["feature_schnorr_policy"] = response[13]
+                    self.feature_nostr_policy = d["feature_nostr_policy"] = response[14]
+                    self.feature_liquid_policy = d["feature_liquid_policy"] = response[15]
+                else:
+                    # unsupported by default
+                    self.feature_schnorr_policy = d["feature_schnorr_policy"] = None
+                    self.feature_nostr_policy = d["feature_nostr_policy"] = None
+                    self.feature_liquid_policy = d["feature_liquid_policy"] = None
 
-        elif (sw1==0x9c) and (sw2==0x04):
-            self.setup_done= d["setup_done"]= False  
-            self.is_seeded= d["is_seeded"]= False
-            self.needs_secure_channel= d["needs_secure_channel"]= False
-            
-        else:
-            logger.warning(f"Unknown error in get_status() (error code {hex(256*sw1+sw2)})")
-            #raise RuntimeError(f"Unknown error in get_status() (error code {hex(256*sw1+sw2)})")
-            
-        return (response, sw1, sw2, d)
+            elif (sw1==0x9c) and (sw2==0x04):
+                self.setup_done = d["setup_done"] = False  
+                self.is_seeded = d["is_seeded"] = False
+                self.needs_secure_channel = d["needs_secure_channel"] = False
+                
+            else:
+                logger.warning(f"Unknown error in get_status() (error code 0x{sw1:02x}{sw2:02x})")
+                raise ApduError(f"Unknown error in get_status() (error code 0x{sw1:02x}{sw2:02x})", sw1, sw2, JCconstants.INS_GET_STATUS, response)
+                
+            return (response, sw1, sw2, d)
+        except Exception as e:
+            logger.warning(f"Unknown error in get_status() ({str(e)})")
+            raise
     
     ###########################################
     #         Generic applet methods          #
@@ -1214,6 +1348,8 @@ class CardConnector:
         (https://bitcoin.stackexchange.com/questions/12554/why-the-signature-is-always-65-13232-bytes-long)
         '''
         logger.debug("In card_sign_message")
+        print("In card_sign_message")  
+        
         if (type(message)==str):
             message = message.encode('utf8')
         if (type(altcoin)==str):
@@ -1278,6 +1414,7 @@ class CardConnector:
         else:
             # Prepend the message for signing as done inside the card!!
             hash = sha256d(msg_magic(message, altcoin))
+            print(f"DEBUG: hash: {hash}")
             compsig=self.parser.parse_message_signature(response, hash, pubkey)
                 
         return (response, sw1, sw2, compsig)
@@ -1386,14 +1523,15 @@ class CardConnector:
 
         if len(txhash)!=32:
             raise ValueError("Wrong txhash length: " + str(len(txhash)) + "(should be 32)")
-        elif chalresponse is None:
-            data= txhash
+        elif chalresponse is None or len(chalresponse) == 0:
+            # If no challenge response is provided, use an empty one
+            data = txhash + list(bytes.fromhex("8000")) + [0] * 20  # 2 middle bytes for 2FA flag + 20 bytes of zeros
         else:
             if len(chalresponse)!=20:
                 raise ValueError("Wrong Challenge response length:"+ str(len(chalresponse)) + "(should be 20)")
-            data= txhash + list(bytes.fromhex("8000")) + chalresponse  # 2 middle bytes for 2FA flag
-        lc= len(data)
-        apdu=[cla, ins, p1, p2, lc]+data
+            data = txhash + list(bytes.fromhex("8000")) + chalresponse  # 2 middle bytes for 2FA flag
+        lc = len(data)
+        apdu = [cla, ins, p1, p2, lc] + data
 
         # send apdu
         response, sw1, sw2 = self.card_transmit(apdu)
@@ -1678,88 +1816,55 @@ class CardConnector:
         return (response, sw1, sw2)
 
     def card_verify_PIN_simple(self, pin = None):
-        ''' Verify card PIN. Use PIN code provided by user first, or cached PIN value if available.
-            Throws exceptions for different cases:
-            * CardNotPresentError if card is not inserted in reader
-            * PinRequiredError if no PIN code is available
-            * WrongPinError if PIN is wrong
-            * PinBlockedError if PIN is blocked after too many attempts
-            * UnexpectedSW12Error for other issues
-        '''
+        """Verify PIN code (simple version)"""
         logger.debug("In card_verify_PIN_simple")
+        print("DEBUG: Starting PIN verification process")
         
-        if not self.card_present:
-            raise CardNotPresentError('No card found! Please insert card!');
-
-        if pin is not None:
-            logger.debug("DEBUG In card_verify_PIN_simple got pin from args!")
-            if type(pin)==str:
-                pin_0= list(pin.encode("utf-8"))
-            elif type(pin)==bytes:
-                pin_0= list(pin)
-            else:
-                raise PinRequiredError(f'PIN should be a String or Bytes, not {type(pin)}')
-        else: 
-            if self.pin is not None:
-                logger.debug("DEBUG In card_verify_PIN_simple got pin from cache!")
-                # recover cached value
-                pin_0= self.pin
-            else:
-                raise PinRequiredError('Device cannot be unlocked without PIN code!')
-
-        cla= JCconstants.CardEdge_CLA
-        ins= JCconstants.INS_VERIFY_PIN
-        apdu=[cla, ins, 0x00, 0x00, len(pin_0)] + pin_0
+        # get PIN from user if not provided
+        if pin is None:
+            print("DEBUG: No PIN provided, requesting from user")
+            pin = getpass.getpass("Enter PIN: ")
+            print("DEBUG: PIN received from user")
         
-        if (self.needs_secure_channel):
-            apdu = self.card_encrypt_secure_channel(apdu)
-        response, sw1, sw2 = self.cardservice.connection.transmit(apdu)
-
-        # secure channel not initialized
-        if sw1 == 0x9c and sw2 == 0x21:
-            logger.error("In card_verify_PIN_simple secure channel not initialized (0x9C21)")
-            self.card_initiate_secure_channel()
-            #raise UninitializedSecureChannelError('Secure channel is not initialized')
-            # resend verify PIN command
-            apdu = [cla, ins, 0x00, 0x00, len(pin_0)] + pin_0
-            apdu = self.card_encrypt_secure_channel(apdu)
-            response, sw1, sw2 = self.cardservice.connection.transmit(apdu)
-
-        # correct PIN: cache PIN value
-        if sw1==0x90 and sw2==0x00: 
-            self.set_pin(0, pin_0) 
-            return response, sw1, sw2
-        # wrong PIN, get remaining tries available (since v0.11)
-        elif sw1==0x63 and (sw2 & 0xc0)==0xc0:
-            logger.error("In card_verify_PIN_simple wrong PIN!")
-            self.set_pin(0, None) #reset cached PIN value
-            logger.debug(f"DEBUG In card_verify_PIN_simple reset cached pin: self.pin: {self.pin}")
-            pin_left= (sw2 & ~0xc0)
-            raise WrongPinError(f"Wrong PIN! {pin_left} tries remaining!", pin_left)
-        # wrong PIN (legacy before v0.11)    
-        elif sw1==0x9c and sw2==0x02:
-            logger.error("In card_verify_PIN_simple wrong PIN!")
-            self.set_pin(0, None) #reset cached PIN value
-            logger.debug(f"DEBUG In card_verify_PIN_simple reset cached pin: self.pin: {self.pin}")
-            (response2, sw1b, sw2b, d)=self.card_get_status() # get number of pin tries remaining
-            pin_left= d.get("PIN0_remaining_tries",-1)
-            raise WrongPinError(f"Wrong PIN! {pin_left} tries remaining!", pin_left)
-        # blocked PIN
-        elif sw1==0x9c and sw2==0x0c:
-            logger.error("In card_verify_PIN_simple Blocked PIN!")
-            self.set_pin(0, None) #reset cached PIN value
-            msg = (f"Too many failed attempts! Your device has been blocked! \n\nYou need your PUK code to unblock it (error code {hex(256*sw1+sw2)})")
-            raise PinBlockedError(msg)
-        # card not setup
-        elif sw1==0x9c and sw2==0x04:
-            logger.error(f"In card_verify_PIN_simple setup not done (code 0x9C04)")
-            raise CardSetupNotDoneError(f"Failed to verify PIN: setup not done (code 0x9C04)")
-        # any other edge case
-        else:
-            self.set_pin(0, None) #reset cached PIN value
-            msg = (f"Please check your card! Unexpected error (error code {hex(256*sw1+sw2)})")
-            raise UnexpectedSW12Error(msg, sw1, sw2)  
-
+        # convert pin to bytes
+        pin_bytes = pin.encode('utf8')
+        print(f"DEBUG: PIN length: {len(pin_bytes)} bytes")
+        
+        # construct APDU
+        apdu = [0x80, JCconstants.INS_VERIFY_PIN, 0x00, 0x00, len(pin_bytes)] + list(pin_bytes)
+        print(f"DEBUG: APDU: {' '.join([f'{x:02x}' for x in apdu[:8]])}")
+        
+        # transmit APDU
+        try:
+            print("DEBUG: Sending PIN verification APDU")
+            (response, sw1, sw2) = self.cardservice.connection.transmit(apdu)
+            print(f"DEBUG: Response: {' '.join([f'{x:02x}' for x in response[:4]])}, SW1: {sw1:02x}, SW2: {sw2:02x}")
+            
+            # check response
+            if (sw1==0x90) and (sw2==0x00):
+                print("DEBUG: PIN verification successful")
+                return (response, sw1, sw2)
+            elif (sw1==0x63) and (sw2==0xC0):
+                print("DEBUG: PIN verification failed - Wrong PIN")
+                raise WrongPinError('Wrong PIN!', 0)
+            elif (sw1==0x63) and (sw2==0xC1):
+                print("DEBUG: PIN verification failed - Wrong PIN (1 try left)")
+                raise WrongPinError('Wrong PIN!', 1)
+            elif (sw1==0x63) and (sw2==0xC2):
+                print("DEBUG: PIN verification failed - Wrong PIN (2 tries left)")
+                raise WrongPinError('Wrong PIN!', 2)
+            elif (sw1==0x63) and (sw2==0xC3):
+                print("DEBUG: PIN verification failed - Wrong PIN (3 tries left)")
+                raise WrongPinError('Wrong PIN!', 3)
+            elif (sw1==0x69) and (sw2==0x83):
+                print("DEBUG: PIN verification failed - PIN blocked")
+                raise PinBlockedError('PIN blocked!')
+            else:
+                print(f"DEBUG: PIN verification failed - Unknown error (SW1: {sw1:02x}, SW2: {sw2:02x})")
+                raise ApduError('Unknown error in verify_PIN()', sw1, sw2, JCconstants.INS_VERIFY_PIN, response)
+        except Exception as e:
+            print(f"DEBUG: Exception during PIN verification: {str(e)}")
+            raise
 
     def card_verify_PIN(self, pin = None):
         ''' This method is deprecated, use card_verify_PIN_simple() preferrably
