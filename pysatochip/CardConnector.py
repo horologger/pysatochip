@@ -22,6 +22,7 @@ import logging
 from os import urandom
 from typing import Union
 import getpass
+import os
 
 #debug
 # import sys
@@ -2051,28 +2052,82 @@ class CardConnector:
     ###########################################
     
     def card_initiate_secure_channel(self):
-        logger.debug("In card_initiate_secure_channel()")
-        cla= JCconstants.CardEdge_CLA
-        ins= 0x81
-        p1= 0x00 
-        p2= 0x00
+        ''' Initialize a secure channel with the card
+        '''
+        logger.debug("In card_initiate_secure_channel")
+        print("\n=== SECURE CHANNEL INITIALIZATION ===")
         
-        # get sc
-        self.sc= SecureChannel(logger.getEffectiveLevel())
-        pubkey= list(self.sc.sc_pubkey_serialized)
-        lc= len(pubkey) #65
-        apdu=[cla, ins, p1, p2, lc] + pubkey
+        # Get card's public key
+        print("\n1. Getting card's public key...")
+        cla = JCconstants.CardEdge_CLA
+        ins = 0x02  # GET_PUBKEY
+        p1 = 0x00
+        p2 = 0x00
+        lc = 0x00
+        apdu = [cla, ins, p1, p2, lc]
+        print(f"APDU: {' '.join([f'{x:02x}' for x in apdu])}")
         
-        # send apdu 
-        response, sw1, sw2 = self.card_transmit(apdu) 
+        (response, sw1, sw2) = self.card_transmit(apdu)
+        print(f"Response: {' '.join([f'{x:02x}' for x in response])}, SW1: {sw1:02x}, SW2: {sw2:02x}")
         
-        # parse response and extract pubkey...
-        peer_pubkey = self.parser.parse_initiate_secure_channel(response)
-        peer_pubkey_bytes= peer_pubkey.get_public_key_bytes(compressed=False)
-        self.sc.initiate_secure_channel(peer_pubkey_bytes)
+        if (sw1 != 0x90 or sw2 != 0x00):
+            raise SecureChannelError(f'Failed to get card public key (error code {hex(256*sw1+sw2)})')
+            
+        # Parse public key from response
+        print("\n2. Parsing card's public key...")
+        self.pubkey = self.parser.parse_initiate_secure_channel(response)
+        print(f"Card public key: {self.pubkey.get_public_key_bytes(compressed=False).hex()}")
         
-        return peer_pubkey             
-       
+        # Generate random challenge
+        print("\n3. Generating random challenge...")
+        challenge = os.urandom(32)
+        print(f"Challenge (32 bytes): {challenge.hex()}")
+        
+        # Encrypt challenge with card's public key
+        print("\n4. Encrypting challenge with card's public key...")
+        from Crypto.PublicKey import RSA
+        from Crypto.Cipher import PKCS1_v1_5
+        
+        # Convert public key to RSA format
+        pubkey_der = self.pubkey.get_public_key_bytes(compressed=False)
+        rsa_key = RSA.importKey(pubkey_der)
+        cipher = PKCS1_v1_5.new(rsa_key)
+        
+        # Encrypt challenge
+        encrypted_challenge = cipher.encrypt(challenge)
+        print(f"Encrypted challenge length: {len(encrypted_challenge)} bytes")
+        print(f"Encrypted challenge: {encrypted_challenge.hex()}")
+        
+        # Send encrypted challenge
+        print("\n5. Sending encrypted challenge to card...")
+        cla = JCconstants.CardEdge_CLA
+        ins = 0x81  # INIT_SECURE_CHANNEL
+        p1 = 0x00
+        p2 = 0x00
+        lc = len(encrypted_challenge)
+        apdu = [cla, ins, p1, p2, lc] + list(encrypted_challenge)
+        print(f"APDU: {' '.join([f'{x:02x}' for x in apdu])}")
+        
+        (response, sw1, sw2) = self.card_transmit(apdu)
+        print(f"Response: {' '.join([f'{x:02x}' for x in response])}, SW1: {sw1:02x}, SW2: {sw2:02x}")
+        
+        if (sw1 != 0x90 or sw2 != 0x00):
+            raise SecureChannelError(f'Failed to initialize secure channel (error code {hex(256*sw1+sw2)})')
+            
+        # Parse response
+        print("\n6. Processing card's response...")
+        response_decrypted = self.card_decrypt_secure_channel(response)
+        print(f"Decrypted response: {response_decrypted.hex()}")
+        
+        # Store session key
+        print("\n7. Setting up session key...")
+        self.session_key = challenge
+        print(f"Session key established: {self.session_key.hex()}")
+        
+        # Set secure channel flag
+        self.needs_secure_channel = False
+        print("\n=== SECURE CHANNEL INITIALIZED SUCCESSFULLY ===\n")
+    
     def card_encrypt_secure_channel(self, apdu):
         logger.debug("In card_encrypt_secure_channel()")
         cla= JCconstants.CardEdge_CLA
